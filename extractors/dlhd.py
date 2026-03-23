@@ -62,7 +62,7 @@ class DLHDExtractor:
 
         # ✅ Lista host iframe (caricata da cache o vuota)
         cached_hosts = cache_data.get("hosts", [])
-        self.iframe_hosts = cached_hosts if cached_hosts else ["dlhd.so", "dlhd.sx", "daddyhd.com"]
+        self.iframe_hosts = cached_hosts if cached_hosts else ["dlhd.so", "dlhd.dad", "daddyhd.com"]
 
         # ✅ Configurazione server dinamica dal worker (usando TEMPLATE completi)
         # Tutti i valori provengono dal worker, i fallback sono solo per il primo avvio
@@ -470,7 +470,7 @@ class DLHDExtractor:
         # Usa base_domain dinamico dal worker
         stream_domain = self.base_domain
 
-        if stream_domain in parsed_url.netloc:
+        if stream_domain and stream_domain in parsed_url.netloc:
             origin = f"{parsed_url.scheme}://{parsed_url.netloc}"
             special_headers = {
                 "User-Agent": self.USER_AGENT,
