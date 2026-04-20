@@ -526,7 +526,8 @@ class HLSProxy:
         # Vavoo, Mediahubmx, Cinemacity, VixSrc, etc.
         bypass_patterns = [
             "vavoo.to", "vcdn.io", "host-cdn.net", "ngolpdkyoctjcddxshli469r.org",
-            "citysync.club", "cccdn.net", "cinemacity.cc", "vixsrc.to", "vixcloud.co"
+            "citysync.club", "cccdn.net", "cinemacity.cc", "vixsrc.to", "vixcloud.co",
+            "lokke.app", "mediahubmx", "vavoo.tv"
         ]
         
         try:
