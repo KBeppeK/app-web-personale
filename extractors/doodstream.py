@@ -87,12 +87,18 @@ class DoodStreamExtractor:
                     logger.info("🛡️ Cloudflare detected in browser, waiting for solve...")
                     await page.wait_for_timeout(10000) # Wait for auto-solve
                 
-                # Store HTML for token parsing
-                captured_data["html"] = await page.content()
-                
-                # Wait up to 15 seconds for the pass_md5 request to appear if not captured yet
+                # Wait up to 30 seconds for the pass_md5 request to appear
                 start_wait = time.time()
-                while not captured_data["base_stream"] and (time.time() - start_wait < 15):
+                while not captured_data["base_stream"] and (time.time() - start_wait < 30):
+                    # Store content as we go to avoid NoneType later
+                    try:
+                        captured_data["html"] = await page.content()
+                    except:
+                        pass
+                    
+                    if captured_data["base_stream"]:
+                        break
+                        
                     # Try to trigger play if possible (sometimes needed)
                     try:
                          await page.click("div.vjs-big-play-button", timeout=1000)
@@ -101,8 +107,17 @@ class DoodStreamExtractor:
                     await asyncio.sleep(1)
                     
             except Exception as e:
-                logger.error(f"Browser extraction error: {e}")
+                # If we have the data, ignore the error (e.g. timeout)
+                if captured_data["base_stream"]:
+                    logger.debug(f"Ignoring browser error as data was already captured: {e}")
+                else:
+                    logger.error(f"Browser extraction error: {e}")
             finally:
+                if not captured_data["html"]:
+                    try:
+                        captured_data["html"] = await page.content()
+                    except:
+                        captured_data["html"] = ""
                 await page.close()
 
         if not captured_data["base_stream"]:
