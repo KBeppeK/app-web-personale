@@ -364,7 +364,7 @@ class DLStreamsExtractor:
             logger.debug("DLStreams server lookup failed for %s: %s", channel_key, exc)
         return "wind"
 
-    async def _capture_browser_session_state(self, channel_id: str, player_url: str | None = None) -> tuple[str | None, str | None]:
+    async def _capture_browser_session_state(self, channel_id: str, player_url: str | None = None, **kwargs) -> tuple[str | None, str | None]:
         channel_key = f"premium{channel_id}"
         if self._is_browser_cooldown_active(channel_key):
             logger.debug("DLStreams browser session capture skipped during cooldown for %s", channel_key)
@@ -398,12 +398,9 @@ class DLStreamsExtractor:
                         nonlocal manifest_text, captured_stream_url
                         try:
                             response_url = str(response.url)
-                            content_type = (response.headers.get("content-type") or "").lower()
-                            is_manifest_candidate = any(
-                                marker in response_url.lower()
-                                for marker in (".m3u8", "mono.css", "/proxy/", "master")
-                            ) or "mpegurl" in content_type
-
+                            # Catch any EXTM3U manifest from a proxy-style URL
+                            is_manifest_candidate = "/proxy/" in response_url and channel_key in response_url
+                            
                             if is_manifest_candidate and response.status == 200:
                                 body = await response.body()
                                 decoded = body.decode("utf-8", errors="ignore")
@@ -430,16 +427,13 @@ class DLStreamsExtractor:
                             logger.debug("DLStreams browser capture hook failed for %s: %s", response.url, exc)
 
                     context.on("response", on_response)
-                    await page.goto(resolved_player_url, wait_until="load", timeout=30000)
+                    # Use original watch page as referer to bypass "Direct access blocked"
+                    referer = kwargs.get("referer") or self.entry_origin
+                    await page.goto(resolved_player_url, wait_until="load", timeout=30000, referer=referer)
                     self._update_shared_activity()
                     
-                    # Small interaction to trigger player/manifest generation
-                    try:
-                        await page.mouse.click(683, 384) # Click center of 1366x768
-                        await page.wait_for_timeout(2000)
-                        self._update_shared_activity()
-                    except:
-                        pass
+                    # No more manual click, it often triggers ads that block the player
+                    await page.wait_for_timeout(2000)
 
                     deadline = time.time() + 35
                     while time.time() < deadline:
@@ -569,7 +563,6 @@ class DLStreamsExtractor:
 
     async def _extract_impl(self, url: str, channel_id: str, **kwargs) -> Dict[str, Any]:
         try:
-
             # Respect bypass_warp or warp from kwargs if provided
             # Force direct routing for DLStreams regardless of query params or caller defaults.
             self.bypass_warp_active = True
@@ -582,20 +575,49 @@ class DLStreamsExtractor:
             iframe_origin = self.entry_origin.rstrip("/")
             lookup_base = self.stream_origin.rstrip("/")
             
-            # Determine server_key early so we can try multiple direct manifest URLs
-            # before requiring a browser refresh.
-            server_key = await self._lookup_server_key(lookup_base, channel_key, iframe_origin)
+            # 1. CHECK MICRO-CACHE (3s)
+            cached_item = self._manifest_cache.get(channel_key)
+            if cached_item and (time.time() - cached_item[1] < 3):
+                logger.debug("DLStreams manifest returned from micro-cache for %s", channel_key)
+                # Build fallback candidate if not in cache (best effort)
+                m3u8_url = f"{lookup_base}/proxy/wind/{channel_key}/mono.css"
+                return {
+                    "destination_url": m3u8_url,
+                    "request_headers": {
+                        "Referer": f"{iframe_origin}/",
+                        "Origin": iframe_origin,
+                        "User-Agent": self.base_headers["User-Agent"],
+                        "Accept": "*/*",
+                    },
+                    "mediaflow_endpoint": self.mediaflow_endpoint,
+                    "captured_manifest": cached_item[0],
+                    "bypass_warp": self.bypass_warp_active
+                }
 
-            # 1. FETCH ACTUAL MANIFEST (Bypassing permanent cache)
+            # 2. PROACTIVE BACKGROUND REFRESH
+            last_refresh = self._last_session_refresh.get(channel_key, 0)
+            refresh_threshold = self._dynamic_refresh_interval.get(channel_key, 900)
+            
+            if last_refresh > 0 and (time.time() - last_refresh > refresh_threshold):
+                if channel_key not in self._refresh_tasks or self._refresh_tasks[channel_key].done():
+                    logger.debug("DLStreams spawning proactive background refresh for %s (threshold: %.1fm)", 
+                                channel_key, refresh_threshold / 60)
+                    async def do_refresh():
+                        try:
+                            await self._capture_browser_session_state(channel_id, referer=url)
+                        except Exception as e:
+                            logger.error("DLStreams background refresh failed: %s", e)
+                    self._refresh_tasks[channel_key] = asyncio.create_task(do_refresh())
+
+            # 3. FETCH ACTUAL MANIFEST
+            server_key = await self._lookup_server_key(lookup_base, channel_key, iframe_origin)
             candidate_urls = [
                 f"{lookup_base}/proxy/{server_key}/{channel_key}/mono.css",
                 f"{lookup_base}/proxy/wind/{channel_key}/mono.css",
                 f"{lookup_base}/proxy/top1/cdn/{channel_key}/mono.css",
             ]
-            # preserve order and remove duplicates
             seen = set()
             candidate_urls = [u for u in candidate_urls if not (u in seen or seen.add(u))]
-            m3u8_url = candidate_urls[0]
             
             playback_headers = {
                 "Referer": f"{iframe_origin}/",
@@ -607,48 +629,16 @@ class DLStreamsExtractor:
                 "Sec-Fetch-Site": "cross-site",
             }
             
-            # Prep cookies for the session if we have them
-            current_cookie_header = self._get_cookie_header_for_url(m3u8_url)
-            if not current_cookie_header and self._captured_cookies:
-                # Prime session jar with captured browser cookies if empty
-                yarl_url = URL(m3u8_url)
+            # Prime cookies
+            if self._captured_cookies:
+                yarl_url = URL(candidate_urls[0])
                 for c in self._captured_cookies:
                     session.cookie_jar.update_cookies({c['name']: c['value']}, response_url=yarl_url)
             
-            # 1. CHECK MICRO-CACHE (3s)
-            cached_item = self._manifest_cache.get(channel_key)
-            if cached_item and (time.time() - cached_item[1] < 3):
-                logger.debug("DLStreams manifest returned from micro-cache for %s", channel_key)
-                return {
-                    "destination_url": m3u8_url,
-                    "request_headers": playback_headers,
-                    "mediaflow_endpoint": self.mediaflow_endpoint,
-                    "captured_manifest": cached_item[0],
-                    "bypass_warp": self.bypass_warp_active
-                }
-
-            # 2. PROACTIVE BACKGROUND REFRESH
-            # Use dynamic interval based on cookie expiration (fallback to 15m if not set yet)
-            last_refresh = self._last_session_refresh.get(channel_key, 0)
-            refresh_threshold = self._dynamic_refresh_interval.get(channel_key, 900)
-            
-            if last_refresh > 0 and (time.time() - last_refresh > refresh_threshold):
-                if channel_key not in self._refresh_tasks or self._refresh_tasks[channel_key].done():
-                    logger.debug("DLStreams spawning proactive background refresh for %s (threshold: %.1fm)", 
-                                channel_key, refresh_threshold / 60)
-                    # We use a wrapper to ensure the task is cleaned up
-                    async def do_refresh():
-                        try:
-                            await self._capture_browser_session_state(channel_id)
-                        except Exception as e:
-                            logger.error("DLStreams background refresh failed: %s", e)
-                    
-                    self._refresh_tasks[channel_key] = asyncio.create_task(do_refresh())
-
-            # 3. FETCH ACTUAL MANIFEST
-            # Initial direct fetch attempt
             captured_manifest = None
             captured_stream_url = None
+            m3u8_url = candidate_urls[0]
+
             for candidate in candidate_urls:
                 captured_manifest = await self._fetch_manifest_directly(candidate, playback_headers)
                 if captured_manifest:
@@ -657,14 +647,13 @@ class DLStreamsExtractor:
                     break
             
             if not captured_manifest:
-                # If direct fetch fails, we need to re-capture session state via browser (synchronous fallback)
                 logger.info("DLStreams direct fetch failed or session expired. Refreshing via browser...")
                 player_urls = self._prioritize_player_urls(channel_id)
                 for candidate in player_urls:
                     await self._prime_dlstreams_session(session, candidate)
-                    captured_manifest, browser_stream_url = await self._capture_browser_session_state(channel_id, candidate)
+                    # Pass the original URL as referer to avoid "Direct access blocked"
+                    captured_manifest, browser_stream_url = await self._capture_browser_session_state(channel_id, candidate, referer=url)
                     if captured_manifest or browser_stream_url:
-                        # Recalculate base after re-capture
                         if browser_stream_url:
                             captured_stream_url = browser_stream_url
                             m3u8_url = browser_stream_url
@@ -679,7 +668,6 @@ class DLStreamsExtractor:
                 self._mark_browser_failure(channel_key)
                 raise ExtractorError("Could not retrieve manifest after browser refresh.")
             
-            # Update micro-cache only for actual manifests
             if captured_manifest:
                 self._manifest_cache[channel_key] = (captured_manifest, time.time())
 
