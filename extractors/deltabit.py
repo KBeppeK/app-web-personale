@@ -221,64 +221,78 @@ class DeltabitExtractor:
             sess_res = await self._request_flaresolverr("sessions.create")
             session_id = sess_res.get("session")
 
-            res = await self._request_flaresolverr("request.get", url, session_id=session_id)
-            solution = res.get("solution", {})
-            text = solution.get("response", "")
-            current_url = solution.get("url", url)
-
-            soup = BeautifulSoup(text, "lxml")
-            
-            img_tag = soup.find("img", src=re.compile(r'data:image/png;base64,'))
-            if img_tag and ddddocr:
-                img_data_b64 = img_tag["src"].split(",")[1]
-                img_data = base64.b64decode(img_data_b64)
+            current_url = url
+            for _ in range(5): # Massimo 5 salti di redirector
+                if not any(d in current_url.lower() for d in ["safego.cc", "clicka.cc", "clicka"]):
+                    break
                 
-                ocr = ddddocr.DdddOcr(show_ad=False)
-                res_captcha = ocr.classification(img_data)
-                logger.debug(f"Deltabit: Solved redirector captcha: {res_captcha}")
-                
-                post_data = urlencode({"captch5": res_captcha, "submit": "Continue"})
-                
-                post_res = await self._request_flaresolverr("request.post", current_url, post_data, session_id=session_id)
-                text = post_res.get("solution", {}).get("response", "")
+                res = await self._request_flaresolverr("request.get", current_url, session_id=session_id)
+                solution = res.get("solution", {})
+                text = solution.get("response", "")
+                current_url = solution.get("url", current_url)
                 soup = BeautifulSoup(text, "lxml")
-            
-            for attempt in range(4):
-                proceed_link = None
-                for a_tag in soup.find_all("a", href=True):
-                    txt = a_tag.get_text().lower()
-                    if "proceed to video" in txt or "continue" in txt:
-                        proceed_link = a_tag
-                        break
-                    for btn in a_tag.find_all("button"):
-                        if "proceed" in btn.get_text().lower():
-                             proceed_link = a_tag
-                             break
-                    if proceed_link: break
                 
-                if not proceed_link:
-                    proceed_link = soup.find("a", href=re.compile(r'deltabit|mixdrop|clicka', re.I))
-                
-                if proceed_link:
-                    new_url = proceed_link["href"]
-                    if new_url.startswith("/"):
-                        new_url = urljoin(current_url, new_url)
-                    logger.debug(f"Deltabit: Resolved redirector -> {new_url}")
-                    return new_url
-                
-                meta_refresh = soup.find("meta", attrs={"http-equiv": re.compile(r'refresh', re.I)})
-                if meta_refresh and "url=" in meta_refresh.get("content", "").lower():
-                    refresh_url = re.search(r'url=(.*)', meta_refresh["content"], re.I).group(1).strip()
-                    if refresh_url:
-                        logger.debug(f"Deltabit: Found meta-refresh redirect: {refresh_url}")
-                        return urljoin(current_url, refresh_url)
-
-                if attempt < 3:
-                    await asyncio.sleep(4)
-                    res = await self._request_flaresolverr("request.get", current_url, session_id=session_id)
-                    text = res.get("solution", {}).get("response", "")
+                # Gestione Captcha
+                img_tag = soup.find("img", src=re.compile(r'data:image/png;base64,'))
+                if img_tag and ddddocr:
+                    img_data_b64 = img_tag["src"].split(",")[1]
+                    img_data = base64.b64decode(img_data_b64)
+                    
+                    ocr = ddddocr.DdddOcr(show_ad=False)
+                    res_captcha = ocr.classification(img_data)
+                    logger.debug(f"Deltabit: Solved redirector captcha: {res_captcha}")
+                    
+                    post_data = urlencode({"captch5": res_captcha, "submit": "Continue"})
+                    post_res = await self._request_flaresolverr("request.post", current_url, post_data, session_id=session_id)
+                    text = post_res.get("solution", {}).get("response", "")
                     soup = BeautifulSoup(text, "lxml")
-            
+
+                # Cerca il link di uscita
+                next_url = None
+                for attempt in range(3):
+                    for a_tag in soup.find_all("a", href=True):
+                        txt = a_tag.get_text().lower()
+                        href = a_tag["href"]
+                        if "proceed to video" in txt or "continue" in txt:
+                            next_url = href
+                            break
+                        for btn in a_tag.find_all("button"):
+                            if "proceed" in btn.get_text().lower():
+                                 next_url = href
+                                 break
+                        if next_url: break
+                    
+                    if not next_url:
+                        # Cerca link che contengono deltabit o altri redirector
+                        target_match = soup.find("a", href=re.compile(r'deltabit|mixdrop|clicka|safego', re.I))
+                        if target_match:
+                            next_url = target_match["href"]
+
+                    if next_url:
+                        if next_url.startswith("/"):
+                            next_url = urljoin(current_url, next_url)
+                        current_url = next_url
+                        break
+                    
+                    # Prova meta-refresh
+                    meta_refresh = soup.find("meta", attrs={"http-equiv": re.compile(r'refresh', re.I)})
+                    if meta_refresh and "url=" in meta_refresh.get("content", "").lower():
+                        refresh_url = re.search(r'url=(.*)', meta_refresh["content"], re.I).group(1).strip()
+                        if refresh_url:
+                            current_url = urljoin(current_url, refresh_url)
+                            next_url = current_url
+                            break
+
+                    if attempt < 2:
+                        await asyncio.sleep(3)
+                        res = await self._request_flaresolverr("request.get", current_url, session_id=session_id)
+                        text = res.get("solution", {}).get("response", "")
+                        soup = BeautifulSoup(text, "lxml")
+
+                if not next_url:
+                    logger.debug(f"Deltabit: No more redirect steps found, current: {current_url}")
+                    break
+
             return current_url
 
         except Exception as e:
